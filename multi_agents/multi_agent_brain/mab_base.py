@@ -1,55 +1,11 @@
 
-import numpy as np
-from copy import copy, deepcopy
+from copy import deepcopy
+
+from multi_agents.generic_agent.generic_agents import SensorAgent, ActuatorAgent, HiddenAgent
+
 import random
 
-class AgentBase():
-
-    def __init__(self, agent_id, nb_channels = 8, mlp_units = [16], final_unit="logistic", nb_class=2, memory_size=1000):
-
-        self.init_life_point = 100
-        self.life_point = copy(self.init_life_point)
-
-        self.agent_id = agent_id
-        self.nb_channels = nb_channels
-        self.model = "TODO model def sous tensorflow"
-
-        self.memory_size = memory_size
-        self.reward_history = []
-
-    def receive_reward(self, reward):
-        self.reward_history.append(reward)
-
-    def action(self, state):
-
-        return 1
-
-
-class ActuatorAgent(AgentBase):
-
-    def __init__(self, assigned_actuator, *args, **kwargs):
-        super(ActuatorAgent, self).__init__(*args, **kwargs)
-
-        self.assigned_actuator = assigned_actuator
-
-
-
-class SensorAgent(AgentBase):
-
-    def __init__(self, assigned_env, *args, **kwargs):
-        super(SensorAgent, self).__init__(*args, **kwargs)
-        self.assign_framework = assigned_env
-
-
-
-class HiddenAgent(AgentBase):
-
-    def __init__(self, agent_layer, time_unit = 1, *args, **kwargs):
-        super(HiddenAgent, self).__init__(*args, **kwargs)
-
-        self.agent_layer = agent_layer
-        self.time_unit = time_unit
-
+import numpy as np
 
 class MultiAgentBrain():
 
@@ -81,8 +37,25 @@ class MultiAgentBrain():
 
         self.parsed_conn_rules = self.parse_connexion_rule()
         self.nb_actuator = self.actuator_count()
+        self.nb_sensor = self.sensor_count()
         self.nb_hidden_by_layer_count_list = self.hidden_by_layer_count_list()
         self.max_hidden_layer = self.compute_max_hidden_layer()
+
+        self.nb_agents_by_cat = {
+            "sensor" : self.nb_sensor,
+            "actuator" : self.nb_actuator,
+            "hidden" : self.nb_hidden_by_layer_count_list
+        }
+
+        # others
+        self.transformed_reward_mapping = {
+            "actuator" : 1,
+            "sensor" : 10,
+            "hidden" : 10
+        }
+    
+    def sensor_count(self):
+        return sum([value for key, value in self.init_agents_composition.items() if key.startswith("sensor:")])
 
     def actuator_count(self):
         return sum([value for key, value in self.init_agents_composition.items() if key.startswith("actuator:")])
@@ -130,7 +103,7 @@ class MultiAgentBrain():
                 for i in range(value):
                     conn_list = []
                     agent_id = key + "_" + str(i)
-                    index_intern_list = [ag_id for ag_id in self.agents_registry.keys() if agent_id!=ag_id and ag_id.startswith("actuator:")]
+                    index_intern_list = [ag_id for ag_id in self.agents_registry.keys() if agent_id!=ag_id and (ag_id.startswith("actuator:") or ag_id.startswith("sensor:"))]
                     conn_list.extend(random.sample(population = index_intern_list, k = nb_conn_intern))
                     index_extern_list = [ag_id for ag_id in self.agents_registry.keys() if ag_id.startswith("hidden:1")]
                     conn_list.extend(random.sample(population = index_extern_list, k = nb_conn_hidd_1))
@@ -152,7 +125,7 @@ class MultiAgentBrain():
                         if self.max_hidden_layer - 1 >=1 :
                             index_extern_list = [ag_id for ag_id in self.agents_registry.keys() if ag_id.startswith(f"hidden:{self.max_hidden_layer - 1}")]
                         else:
-                            index_extern_list = [ag_id for ag_id in self.agents_registry.keys() if ag_id.startswith(f"actuator:")]
+                            index_extern_list = [ag_id for ag_id in self.agents_registry.keys() if (ag_id.startswith(f"actuator:") or ag_id.startswith('sensor:'))]
                         conn_list.extend(random.sample(population = index_extern_list, k = nb_conn_hidd_down_layer))
                         self.agents_connexion[agent_id] = conn_list
                 else:
@@ -174,21 +147,48 @@ class MultiAgentBrain():
                         conn_list.extend(random.sample(population = index_up_list, k = nb_conn_hidd_up_layer))
                         self.agents_connexion[agent_id] = conn_list
 
+    def return_category_and_deep_pos_layer_from_agent_id(self, agent_id):
 
-    def reward_distrib_at_group(self, reward, agent_list):
-
-        if int(self.reward_retention_coeff*reward) <= len(agent_list):
-            reward_distrib = reward
+        agent_category = agent_id.split(":")[0]
+        if agent_category == "hidden":
+            pos_layer = int(agent_id.split("hidden:")[1].split("_")[0])
         else:
-            reward_distrib = int(self.reward_retention_coeff*reward)
+            pos_layer = 1
+
+        return agent_category, pos_layer
+
+    def adapt_reward_to_agent(self, reward, agent_category, pos_layer):
+
+        base_transfo = self.transformed_reward_mapping.get(agent_category)
+        if agent_category == "hidden":
+            nb_consecutive_agents_in_layer = self.nb_agents_by_cat.get(agent_category)[pos_layer - 1]
+        else:
+            nb_consecutive_agents_in_layer = self.nb_agents_by_cat.get(agent_category)
+
+        return np.round((reward * base_transfo**(pos_layer) * nb_consecutive_agents_in_layer)/ 100, 4)
+    
+    
+    def reward_distrib_at_group(self, reward, agent_list):
 
         len_group = len(agent_list)
 
+        if int(self.reward_retention_coeff*reward) <= len_group:
+            reward_per_agent = 1
+        else:
+            reward_per_agent = np.round(self.reward_retention_coeff*reward/len_group, 4)
+
+
         for agent_id in agent_list:
-            curr_reward = reward_distrib//len_group
-            if curr_reward > 0:
-                self.agents_registry[agent_id].receive_reward(curr_reward*(len_group))
-                reward -= curr_reward
+            
+            agent_category, pos_layer = self.return_category_and_deep_pos_layer_from_agent_id(agent_id=agent_id)
+
+            transformed_reward = self.adapt_reward_to_agent(reward_per_agent, agent_category, pos_layer)
+
+            if transformed_reward >=1 :
+                self.agents_registry[agent_id].receive_reward(transformed_reward)
+                reward -= reward_per_agent
+            else:
+                pass
 
         return reward
     
@@ -209,5 +209,3 @@ class MultiAgentBrain():
         init_agent_list = [ag_id for ag_id in self.agents_registry if ag_id.startswith(direct_agent_group)]
 
         self.iterative_reward_distrib(reward, init_agent_list)
-
-                        
